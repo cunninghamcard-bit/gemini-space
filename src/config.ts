@@ -32,17 +32,9 @@ export interface ServerConfig {
   logging: LoggingConfig;
 }
 
-export function pinnedAgyBinPath(stateDir: string): string {
-  return join(stateDir, "bin", "agy");
-}
-
-export function resolveDefaultAgyBin(stateDir: string, env: NodeJS.ProcessEnv = process.env): string {
+export function resolveDefaultAgyBin(env: NodeJS.ProcessEnv = process.env): string {
   if (env.DEVSPACE_AGY_BIN?.trim()) {
     return resolve(expandHomePath(env.DEVSPACE_AGY_BIN));
-  }
-  const pinned = pinnedAgyBinPath(stateDir);
-  if (existsSync(pinned)) {
-    return pinned;
   }
   return join(homedir(), ".local", "bin", "agy");
 }
@@ -77,7 +69,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   );
   const agyBin = stored.agy.bin
     ? resolve(expandHomePath(stored.agy.bin))
-    : resolveDefaultAgyBin(stateDir, env);
+    : resolveDefaultAgyBin(env);
 
   return {
     configDir: files.dir,

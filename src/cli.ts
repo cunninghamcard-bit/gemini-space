@@ -1,14 +1,11 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { chmodSync, constants, copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
 import { satisfies } from "semver";
 import { AgyBridge } from "./agy-bridge.js";
-import { loadConfig, pinnedAgyBinPath } from "./config.js";
+import { loadConfig } from "./config.js";
 import { openDatabase } from "./db/client.js";
-import { expandHomePath } from "./path-utils.js";
 import { createServer } from "./server.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import {
@@ -23,7 +20,6 @@ import { DEVSPACE_VERSION } from "./version.js";
 type Command =
   | "serve"
   | "init"
-  | "pin-agy"
   | "doctor"
   | "config"
   | "help"
@@ -49,9 +45,6 @@ async function main(argv: string[]): Promise<void> {
     case "init":
       runInit(args);
       return;
-    case "pin-agy":
-      runPinAgy(args);
-      return;
     case "doctor":
       await runDoctor();
       return;
@@ -69,7 +62,7 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(raw: string | undefined): Command {
   if (!raw || raw === "serve" || raw === "start") return "serve";
-  if (raw === "init" || raw === "pin-agy" || raw === "doctor" || raw === "config") return raw;
+  if (raw === "init" || raw === "doctor" || raw === "config") return raw;
   if (raw === "help" || raw === "--help" || raw === "-h") return "help";
   if (raw === "version" || raw === "--version" || raw === "-v") return "version";
   throw new Error(`Unknown command: ${raw}`);
@@ -126,31 +119,6 @@ function runInit(args: string[]): void {
   } else {
     console.log(`Existing owner token preserved in ${files.authPath}`);
   }
-}
-
-function runPinAgy(args: string[]): void {
-  const files = loadDevspaceFiles();
-  const stateDir = resolve(expandHomePath(files.config.storage.stateDir));
-  const source = resolve(
-    expandHomePath(args[0] ?? join(homedir(), ".local", "bin", "agy")),
-  );
-  if (!existsSync(source)) {
-    throw new Error(`Source agy binary not found: ${source}`);
-  }
-
-  const dest = pinnedAgyBinPath(stateDir);
-  mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
-
-  // Prefer APFS copy-on-write clone on macOS (zero extra disk blocks for ~210MB binary).
-  try {
-    copyFileSync(source, dest, constants.COPYFILE_FICLONE);
-  } catch {
-    copyFileSync(source, dest);
-  }
-  chmodSync(dest, 0o755);
-
-  const version = execFileSync(dest, ["--version"], { encoding: "utf8" }).trim();
-  console.log(`Pinned agy (${version}) -> ${dest}`);
 }
 
 async function runDoctor(): Promise<void> {
@@ -221,7 +189,6 @@ function printHelp(): void {
       "",
       "Commands:",
       "  devspace serve              Start the OAuth + AGY MCP bridge server",
-      "  devspace pin-agy [src]      Clone agy binary into stateDir/bin/agy to isolate from auto-updates",
       "  devspace doctor             Verify config, OAuth SQLite state, and live agy bridge tools",
       "  devspace init [--public-url <url>]  Initialize config.jsonc and owner password",
       "  devspace config [show | set <key> <value>]",

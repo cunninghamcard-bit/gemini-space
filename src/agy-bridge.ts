@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { resolve } from "node:path";
@@ -145,6 +145,7 @@ export class AgyBridge {
   private gatewayServer: http.Server | undefined;
   private gatewayPort = 0;
   private runtime: AgyRuntime | undefined;
+  private runtimeBinMtimeMs = 0;
   private runtimePromise: Promise<AgyRuntime> | undefined;
   private decls: AgyFunctionDeclaration[] | undefined;
   private readonly declsWaiters: Array<() => void> = [];
@@ -492,9 +493,43 @@ export class AgyBridge {
     }
   }
 
+  private hasActiveWork(): boolean {
+    if (this.pendingCalls.size > 0) return true;
+    for (const entry of this.mcpSessions.values()) {
+      if (entry.runningTasks.size > 0) return true;
+    }
+    return false;
+  }
+
+  private currentBinMtimeMs(): number {
+    try {
+      return statSync(this.config.bin).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }
+
   private async ensureRuntimeAndDeclarations(): Promise<AgyRuntime> {
     if (this.closing) {
       throw new Error("AGY bridge is shutting down");
+    }
+    // Hot-reload agy acp if ~/.local/bin/agy was auto-updated on disk while idle.
+    if (this.runtime && !this.hasActiveWork()) {
+      const mtime = this.currentBinMtimeMs();
+      if (mtime > 0 && this.runtimeBinMtimeMs > 0 && mtime !== this.runtimeBinMtimeMs) {
+        logEvent(this.logging, "info", "agy_binary_updated_reloading", {
+          bin: this.config.bin,
+        });
+        const old = this.runtime;
+        this.runtime = undefined;
+        this.decls = undefined;
+        this.sessionsByAgyId.clear();
+        for (const entry of this.mcpSessions.values()) {
+          entry.agySessionId = undefined;
+          entry.turnCount = 0;
+        }
+        await old.close();
+      }
     }
     if (this.runtime && this.decls) {
       return this.runtime;
@@ -508,12 +543,12 @@ export class AgyBridge {
   }
 
   private async spawnAndWarmup(): Promise<AgyRuntime> {
+    const binMtime = this.currentBinMtimeMs();
     const proc = spawn(this.config.bin, ["acp", "--disable-telemetry"], {
       cwd: this.config.workspace,
       env: {
         ...process.env,
         HOME: this.config.agyHome,
-        AGY_CLI_DISABLE_AUTO_UPDATE: "1",
         AGY_LLM_GATEWAY_URL: `http://127.0.0.1:${this.gatewayPort}`,
         AGY_LLM_GATEWAY_API_KEY: "devspace-local",
         AGY_LLM_GATEWAY_WIRE_PROTOCOL: this.config.wireProtocol,
@@ -687,6 +722,7 @@ export class AgyBridge {
     }
 
     this.runtime = runtime;
+    this.runtimeBinMtimeMs = binMtime;
     logEvent(this.logging, "info", "agy_bridge_ready", {
       pid: proc.pid ?? null,
       gatewayPort: this.gatewayPort,
