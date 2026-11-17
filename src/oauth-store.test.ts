@@ -64,18 +64,21 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
 
     const migrations = database.sqlite
       .prepare("select version, name from devspace_schema_migrations order by version")
-      .all();
+      .all() as Array<{ version: number; name: string }>;
 
-    // Every migration applies once, in order, with no gaps.
-    assert.deepEqual(
-      // SAFETY: The surrounding checks or construction already match this type.
-      migrations.map((migration) => (migration as { version: number }).version),
-      migrations.map((_, index) => index + 1),
-    );
-    assert.ok(migrations.length > 0);
+    assert.ok(migrations.some((m) => m.version === 2 && m.name === "oauth-state"));
+
+    // Verify compatibility with pre-existing Synrex migration rows (v8..v11).
+    database.sqlite
+      .prepare("insert into devspace_schema_migrations (version, name, applied_at) values (?, ?, ?)")
+      .run(8, "learning-memory", new Date().toISOString());
   } finally {
     database.close();
   }
+
+  // Reopening with foreign/Synrex migration history must succeed cleanly.
+  const reopenedWithSynrexHistory = openDatabase(stateDir);
+  reopenedWithSynrexHistory.close();
 
   if (process.platform !== "win32") {
     assert.equal((await stat(stateDir)).mode & 0o777, 0o700);

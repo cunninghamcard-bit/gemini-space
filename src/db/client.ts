@@ -1,16 +1,12 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { drizzle } from "drizzle-orm/node-sqlite";
 import { migrateDatabase } from "./migrations.js";
 import { openSqlite, type SqliteDatabase } from "./sqlite.js";
 
 export { transaction, type SqliteDatabase } from "./sqlite.js";
 
-export type AppDatabase = ReturnType<typeof createDrizzleDatabase>;
-
 export interface DatabaseHandle {
   sqlite: SqliteDatabase;
-  db: AppDatabase;
   close(): void;
 }
 
@@ -34,11 +30,6 @@ export function openDatabase(stateDir: string): DatabaseHandle {
 
   return {
     sqlite,
-    db: createDrizzleDatabase(sqlite),
     close: () => sqlite.close(),
   };
-}
-
-function createDrizzleDatabase(sqlite: SqliteDatabase) {
-  return drizzle({ client: sqlite });
 }

@@ -2,7 +2,6 @@ import type { WireInput } from "./json-value.js";
 import { randomBytes } from "node:crypto";
 import {
   existsSync,
-  linkSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -25,15 +24,13 @@ import {
   type DevspaceConfig,
   type DevspaceConfigInput,
 } from "./config-schema.js";
-import { migrateLegacyConfig } from "./config-migration.js";
-import { expandHomePath } from "./roots.js";
+import { expandHomePath } from "./path-utils.js";
 
 const devspaceAuthConfigSchema = z.object({
   ownerToken: z.string().optional(),
 }).passthrough();
 
 export type DevspaceUserConfig = DevspaceConfig;
-
 export type DevspaceAuthConfig = z.infer<typeof devspaceAuthConfigSchema>;
 
 export interface DevspaceFiles {
@@ -44,7 +41,6 @@ export interface DevspaceFiles {
   authExists: boolean;
   config: DevspaceConfig;
   auth: DevspaceAuthConfig;
-  migratedLegacyConfig: boolean;
 }
 
 export interface DevspaceConfigEdit {
@@ -60,35 +56,14 @@ export function devspaceConfigPath(env: NodeJS.ProcessEnv = process.env): string
   return join(devspaceConfigDir(env), "config.jsonc");
 }
 
-export function devspaceLegacyConfigPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(devspaceConfigDir(env), "config.json");
-}
-
-export function devspaceLegacyConfigBackupPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(devspaceConfigDir(env), "config.json.v1.0.bak");
-}
-
 export function devspaceAuthPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(devspaceConfigDir(env), "auth.json");
-}
-
-export function devspaceSkillsDir(env: NodeJS.ProcessEnv = process.env): string {
-  return join(devspaceConfigDir(env), "skills");
-}
-
-export function devspaceAgentsDir(env: NodeJS.ProcessEnv = process.env): string {
-  return join(devspaceConfigDir(env), "agents");
 }
 
 export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): DevspaceFiles {
   const dir = devspaceConfigDir(env);
   const configPath = devspaceConfigPath(env);
-  const legacyConfigPath = devspaceLegacyConfigPath(env);
   const authPath = devspaceAuthPath(env);
-
-  const migratedLegacyConfig = !existsSync(configPath) && existsSync(legacyConfigPath)
-    ? migrateLegacyConfigFile(legacyConfigPath, configPath, devspaceLegacyConfigBackupPath(env))
-    : false;
 
   const configExists = existsSync(configPath);
   const authExists = existsSync(authPath);
@@ -101,7 +76,6 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
     authExists,
     config: configExists ? readJsoncConfig(configPath) : defaultDevspaceConfig(),
     auth: authExists ? readJsonFile(authPath, devspaceAuthConfigSchema) : {},
-    migratedLegacyConfig,
   };
 }
 
@@ -112,7 +86,6 @@ export function writeDevspaceConfig(
   const filePath = devspaceConfigPath(env);
   const parsed = devspaceConfigSchema.parse(config);
   atomicWrite(filePath, serializeConfig(parsed), 0o600);
-
   return filePath;
 }
 
@@ -129,7 +102,6 @@ export function setDevspaceConfigValues(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   const files = loadDevspaceFiles(env);
-
   const source = files.configExists
     ? readFileSync(files.configPath, "utf8")
     : serializeConfig(files.config);
@@ -143,7 +115,6 @@ export function setDevspaceConfigValues(
 
   parseJsoncConfig(updated, files.configPath);
   atomicWrite(files.configPath, updated.endsWith("\n") ? updated : `${updated}\n`, 0o600);
-
   return files.configPath;
 }
 
@@ -153,68 +124,12 @@ export function writeDevspaceAuth(
 ): string {
   const filePath = devspaceAuthPath(env);
   mkdirSync(devspaceConfigDir(env), { recursive: true });
-  writeJsonFile(filePath, devspaceAuthConfigSchema.parse(auth), 0o600);
-
+  writeFileSync(filePath, `${JSON.stringify(devspaceAuthConfigSchema.parse(auth), null, 2)}\n`, { mode: 0o600 });
   return filePath;
 }
 
 export function generateOwnerToken(): string {
   return randomBytes(32).toString("base64url");
-}
-
-function migrateLegacyConfigFile(
-  legacyPath: string,
-  configPath: string,
-  backupPath: string,
-): boolean {
-  if (existsSync(backupPath)) {
-    throw new Error(
-      `Unable to migrate ${legacyPath}: backup already exists at ${backupPath}. `
-      + `Move ${backupPath} out of the way, then run DevSpace again.`,
-    );
-  }
-
-  let migrated: DevspaceConfig;
-
-  try {
-    // SAFETY: The surrounding checks or construction already match this type.
-    migrated = migrateLegacyConfig(JSON.parse(readFileSync(legacyPath, "utf8")) as unknown);
-  } catch (error) {
-    throw fileError("migrate", legacyPath, error);
-  }
-
-  const temporaryPath = temporaryFilePath(configPath);
-  let published = false;
-
-  try {
-    mkdirSync(dirname(configPath), { recursive: true });
-    writeFileSync(temporaryPath, serializeConfig(migrated), { mode: 0o600, flag: "wx" });
-    readJsoncConfig(temporaryPath);
-
-    try {
-      // A hard link publishes the complete temporary file atomically without
-      // replacing config.jsonc if another first-start process won the race.
-      linkSync(temporaryPath, configPath);
-    } catch (error) {
-      if (!isErrnoException(error) || error.code !== "EEXIST") throw error;
-      readJsoncConfig(configPath);
-
-      return false;
-    }
-
-    published = true;
-    renameSync(legacyPath, backupPath);
-  } catch (error) {
-    if (published && existsSync(legacyPath)) {
-      rmSync(configPath, { force: true });
-    }
-
-    throw fileError("migrate", legacyPath, error);
-  } finally {
-    rmSync(temporaryPath, { force: true });
-  }
-
-  return true;
 }
 
 function readJsoncConfig(filePath: string): DevspaceConfig {
@@ -250,7 +165,10 @@ function serializeConfig(config: DevspaceConfig): string {
 
 function atomicWrite(filePath: string, source: string, mode: number): void {
   mkdirSync(dirname(filePath), { recursive: true });
-  const temporaryPath = temporaryFilePath(filePath);
+  const temporaryPath = join(
+    dirname(filePath),
+    `.${basename(filePath)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
+  );
 
   try {
     writeFileSync(temporaryPath, source, { mode, flag: "wx" });
@@ -261,34 +179,17 @@ function atomicWrite(filePath: string, source: string, mode: number): void {
   }
 }
 
-function temporaryFilePath(filePath: string): string {
-  return join(
-    dirname(filePath),
-    `.${basename(filePath)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
-  );
-}
-
 function readJsonFile<T>(filePath: string, schema: z.ZodType<T>): T {
   try {
-    // SAFETY: The surrounding checks or construction already match this type.
     return schema.parse(JSON.parse(readFileSync(filePath, "utf8")) as unknown);
   } catch (error) {
     throw fileError("read", filePath, error);
   }
 }
 
-function writeJsonFile(filePath: string, value: WireInput, mode: number): void {
-  writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, { mode });
-}
-
-function fileError(action: "read" | "migrate", filePath: string, error: WireInput): Error {
+function fileError(action: "read", filePath: string, error: WireInput): Error {
   const reason = error instanceof Error ? error.message : String(error);
-
   return new DevspaceConfigFileError(`Unable to ${action} ${filePath}: ${reason}`);
-}
-
-function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error;
 }
 
 class DevspaceConfigFileError extends Error {}

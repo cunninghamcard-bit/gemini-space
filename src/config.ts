@@ -1,76 +1,60 @@
-import { resolve } from "node:path";
-import { expandHomePath } from "./roots.js";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import type { LoggingConfig } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
-import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles, type DevspaceFiles } from "./user-config.js";
-import {
-  disabledSubagentsConfig,
-  implicitSubagentsConfig,
-  resolveSubagentsConfig,
-  type SubagentsConfig,
-} from "./local-agent-config.js";
+import { expandHomePath } from "./path-utils.js";
+import { loadDevspaceFiles } from "./user-config.js";
 
-/** What `devspace agents` and the agent daemon need. They run without OAuth, a public URL, or a server. */
-export interface AgentConfig {
-  configDir: string;
-  allowedRoots: string[];
-  stateDir: string;
-  worktreeRoot: string;
-  devspaceAgentsDir: string;
-  subagents: SubagentsConfig;
-  agentDir: string;
+export interface AgyBridgeConfig {
+  bin: string;
+  workspace: string;
+  agyHome: string;
+  modelId: string;
+  wireProtocol: "genai" | "openai";
+  holdMs: number;
+  callTimeoutMs: number;
+  maxTurnsPerSession: number;
+  sessionIdleTtlMs: number;
+  exposedTools: string[];
 }
 
-export interface ServerConfig extends AgentConfig {
+export interface ServerConfig {
+  configDir: string;
+  stateDir: string;
   host: string;
   port: number;
+  listenPort: number;
   oauth: OAuthConfig;
   allowedHosts: string[];
   publicBaseUrl: string;
-  /** Explicit `tools.mode`; when set it wins over host detection. */
-  toolSurfaceOverride: "claude" | "codex" | undefined;
-  experimentalCodeMode: boolean;
-  uiEnabled: boolean;
-  activity: { enabled: boolean; maxTurns: number };
-  artifactsEnabled: boolean;
-  artifactMaxFileBytes: number;
-  skillsEnabled: boolean;
-  skillPaths: string[];
-  devspaceSkillsDir: string;
+  agy: AgyBridgeConfig;
   logging: LoggingConfig;
 }
 
-/**
- * Agent commands need no server setup. Without a `subagents` key they detect the installed
- * coding agents; an explicit `subagents` config, including `enabled: false`, always wins.
- */
-export function loadAgentConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
-  const files = loadDevspaceFiles(env);
-  const { subagents } = files.config;
-
-  return agentConfig(files, env, subagents ? resolveSubagentsConfig(subagents) : implicitSubagentsConfig());
+export function pinnedAgyBinPath(stateDir: string): string {
+  return join(stateDir, "bin", "agy");
 }
 
-function agentConfig(files: DevspaceFiles, env: NodeJS.ProcessEnv, subagents: SubagentsConfig): AgentConfig {
-  const stored = files.config;
-
-  return {
-    configDir: files.dir,
-    allowedRoots: normalizePaths(stored.workspaces.allowedRoots, [process.cwd()]),
-    stateDir: normalizePath(stored.storage.stateDir),
-    worktreeRoot: normalizePath(stored.workspaces.worktreeRoot),
-    devspaceAgentsDir: devspaceAgentsDir(env),
-    subagents,
-    agentDir: normalizePath(stored.skills.agentDir),
-  };
+export function resolveDefaultAgyBin(stateDir: string, env: NodeJS.ProcessEnv = process.env): string {
+  if (env.DEVSPACE_AGY_BIN?.trim()) {
+    return resolve(expandHomePath(env.DEVSPACE_AGY_BIN));
+  }
+  const pinned = pinnedAgyBinPath(stateDir);
+  if (existsSync(pinned)) {
+    return pinned;
+  }
+  return join(homedir(), ".local", "bin", "agy");
 }
 
-/** Strict config for `devspace serve`: requires the owner token. Subagents stay an explicit opt-in. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadDevspaceFiles(env);
   const stored = files.config;
+  const stateDir = resolve(expandHomePath(stored.storage.stateDir));
   const host = stored.server.host;
   const port = stored.server.port;
+  const listenPortOverride = env.DEVSPACE_LISTEN_PORT ?? env.SYNREX_CORE_LISTEN_PORT;
+  const listenPort = listenPortOverride !== undefined ? parseListenPort(listenPortOverride) : port;
 
   const publicBaseUrl = parsePublicBaseUrl(
     stored.server.publicBaseUrl ?? localPublicBaseUrl(host, port),
@@ -85,10 +69,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ...stored.server.allowedHosts,
   ];
 
+  const workspace = resolve(
+    expandHomePath(env.DEVSPACE_AGY_WORKSPACE ?? stored.agy.workspace),
+  );
+  const agyHome = resolve(
+    expandHomePath(env.DEVSPACE_AGY_HOME ?? stored.agy.agyHome ?? join(stateDir, "agy-home")),
+  );
+  const agyBin = stored.agy.bin
+    ? resolve(expandHomePath(stored.agy.bin))
+    : resolveDefaultAgyBin(stateDir, env);
+
   return {
-    ...agentConfig(files, env, resolveSubagentsConfig(stored.subagents ?? disabledSubagentsConfig())),
+    configDir: files.dir,
+    stateDir,
     host,
     port,
+    listenPort,
     oauth: {
       ownerToken: parseRequiredSecret(
         env.DEVSPACE_OAUTH_OWNER_TOKEN ?? files.auth.ownerToken,
@@ -102,15 +98,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     },
     allowedHosts: normalizeAllowedHosts(derivedAllowedHosts),
     publicBaseUrl,
-    toolSurfaceOverride: stored.tools.mode,
-    experimentalCodeMode: env.DEVSPACE_EXPERIMENTAL_CODE_MODE === "1",
-    uiEnabled: stored.ui.enabled,
-    activity: stored.activity,
-    artifactsEnabled: stored.artifacts.enabled,
-    artifactMaxFileBytes: stored.artifacts.maxFileBytes,
-    skillsEnabled: stored.skills.enabled,
-    skillPaths: stored.skills.paths,
-    devspaceSkillsDir: devspaceSkillsDir(env),
+    agy: {
+      bin: agyBin,
+      workspace,
+      agyHome,
+      modelId: env.DEVSPACE_AGY_MODEL ?? stored.agy.modelId,
+      wireProtocol: stored.agy.wireProtocol,
+      holdMs: stored.agy.holdMs,
+      callTimeoutMs: stored.agy.callTimeoutMs,
+      maxTurnsPerSession: stored.agy.maxTurnsPerSession,
+      sessionIdleTtlMs: stored.agy.sessionIdleTtlMs,
+      exposedTools: env.DEVSPACE_AGY_TOOLS
+        ? env.DEVSPACE_AGY_TOOLS.split(",").map((s) => s.trim()).filter(Boolean)
+        : stored.agy.exposedTools,
+    },
     logging: {
       ...stored.logging,
       trustProxy: stored.server.trustProxy,
@@ -118,35 +119,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   };
 }
 
-function normalizePaths(paths: string[], fallback: string[] = []): string[] {
-  return (paths.length > 0 ? paths : fallback).map(normalizePath);
-}
-
-function normalizePath(path: string): string {
-  return resolve(expandHomePath(path));
+function parseListenPort(raw: string): number {
+  const n = Number(raw.trim());
+  if (!Number.isInteger(n) || n < 1 || n > 65_535) {
+    throw new Error(`Invalid listen port override: ${raw}`);
+  }
+  return n;
 }
 
 function normalizeAllowedHosts(hosts: string[]): string[] {
   if (hosts.includes("*")) return ["*"];
-
-  return Array.from(new Set(hosts.flatMap((host) => {
-    const trimmed = host.trim();
-
-    return trimmed ? [trimmed] : [];
-  })));
+  return Array.from(new Set(hosts.map((h) => h.trim()).filter(Boolean)));
 }
 
 function parseRequiredSecret(value: string | undefined): string {
   const secret = value?.trim();
-
   if (!secret) {
     throw new Error("OAuth owner token is required. Run: devspace init");
   }
-
   if (secret.length < 16) {
     throw new Error("OAuth owner token must be at least 16 characters long.");
   }
-
   return secret;
 }
 
@@ -155,16 +148,13 @@ function parsePublicBaseUrl(value: string): string {
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
-
   return parsed.toString().replace(/\/$/, "");
 }
 
 function localPublicBaseUrl(host: string, port: number): string {
   const publicHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-
   const formattedHost = publicHost.includes(":") && !publicHost.startsWith("[")
     ? `[${publicHost}]`
     : publicHost;
-
   return `http://${formattedHost}:${port}`;
 }
