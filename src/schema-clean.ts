@@ -71,6 +71,11 @@ function cleanNode(node: unknown): unknown {
       continue;
     }
 
+    if ((key === "minLength" || key === "maxLength") && typeof value === "string" && /^\d+$/.test(value)) {
+      out[key] = Number(value);
+      continue;
+    }
+
     out[key] = cleanNode(value);
   }
 

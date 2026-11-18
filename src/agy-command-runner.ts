@@ -1,0 +1,783 @@
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import {
+  AgyToolExecutionError,
+  formatAgyTimestamp,
+  formatAgyUtcTimestamp,
+} from "./agy-tool-schemas.js";
+
+const MAX_TOOL_OUTPUT_BYTES = 10_240;
+const TAIL_PREVIEW_BYTES = 1_000;
+
+// 7-bit ANSI CSI, OSC, and 2-char ESC sequences (preserves \r, \n, \t, \b, \x07)
+const ANSI_ESCAPE_RE =
+  // eslint-disable-next-line no-control-regex
+  /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
+
+const PYTHON_PTY_SHIM = `
+import errno, fcntl, os, pty, select, signal, struct, sys, termios
+
+cmd = sys.argv[1]
+master_fd, slave_fd = pty.openpty()
+fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+
+pid = os.fork()
+if pid == 0:
+    os.close(master_fd)
+    os.setsid()
+    try:
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+    except OSError:
+        pass
+    os.dup2(slave_fd, 0)
+    os.dup2(slave_fd, 1)
+    os.dup2(slave_fd, 2)
+    if slave_fd > 2:
+        os.close(slave_fd)
+    shell = "/bin/zsh" if os.path.exists("/bin/zsh") else os.environ.get("SHELL", "/bin/sh")
+    os.execv(shell, [os.path.basename(shell), "-c", cmd])
+
+os.close(slave_fd)
+try:
+    os.write(3, f"PID:{pid}\\n".encode("ascii"))
+except OSError:
+    pass
+
+stdin_open = True
+master_open = True
+reaped_status = None
+
+def drain_master_nonblocking():
+    os.set_blocking(master_fd, False)
+    while True:
+        try:
+            chunk = os.read(master_fd, 16384)
+            if not chunk:
+                break
+            os.write(1, chunk)
+        except OSError:
+            break
+
+while master_open:
+    if reaped_status is None:
+        try:
+            wpid, wstatus = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
+                reaped_status = wstatus
+                drain_master_nonblocking()
+                break
+        except ChildProcessError:
+            break
+    rlist = [master_fd] + ([0] if stdin_open else [])
+    try:
+        ready, _, _ = select.select(rlist, [], [], 0.05)
+    except InterruptedError:
+        continue
+    if master_fd in ready:
+        try:
+            data = os.read(master_fd, 16384)
+            if not data:
+                master_open = False
+            else:
+                os.write(1, data)
+        except OSError as e:
+            if e.errno in (errno.EIO, errno.EBADF):
+                master_open = False
+            else:
+                raise
+    if stdin_open and 0 in ready:
+        try:
+            inp = os.read(0, 16384)
+            if not inp:
+                stdin_open = False
+            else:
+                os.write(master_fd, inp)
+        except OSError:
+            stdin_open = False
+
+try:
+    os.close(master_fd)
+except OSError:
+    pass
+
+if reaped_status is None:
+    _, status = os.waitpid(pid, 0)
+else:
+    status = reaped_status
+if os.WIFSIGNALED(status):
+    sig = os.WTERMSIG(status)
+    try:
+        os.write(3, f"SIG:{sig}\\n".encode("ascii"))
+    except OSError:
+        pass
+    os._exit(128 + sig)
+os._exit(os.WEXITSTATUS(status))
+`.trim();
+
+let cachedPythonBin: string | null | undefined;
+
+function detectPythonPtyBin(): string | null {
+  if (cachedPythonBin !== undefined) return cachedPythonBin;
+  if (process.platform === "win32") {
+    cachedPythonBin = null;
+    return null;
+  }
+  for (const candidate of ["/usr/bin/python3", "python3"]) {
+    try {
+      execFileSync(candidate, ["-c", "import pty"], { stdio: "ignore", timeout: 1_500 });
+      cachedPythonBin = candidate;
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  cachedPythonBin = null;
+  return null;
+}
+
+export function stripAnsiAndDecode(raw: Buffer): string {
+  const decoded = new TextDecoder("utf-8", { fatal: false }).decode(raw);
+  return decoded.replace(ANSI_ESCAPE_RE, "");
+}
+
+function encodeFileUri(absPath: string): string {
+  return pathToFileURL(absPath).href;
+}
+
+function trimHeadUtf8(buf: Buffer, maxBytes: number): string {
+  if (buf.length <= maxBytes) return buf.toString("utf8");
+  let end = maxBytes;
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) {
+    end -= 1;
+  }
+  return buf.subarray(0, end).toString("utf8");
+}
+
+function trimTailUtf8(buf: Buffer, maxBytes: number): string {
+  if (buf.length <= maxBytes) return buf.toString("utf8");
+  let start = buf.length - maxBytes;
+  while (start < buf.length && (buf[start]! & 0xc0) === 0x80) {
+    start += 1;
+  }
+  return buf.subarray(start).toString("utf8");
+}
+
+/**
+ * Truncates formatted tool output exceeding 10,240 bytes using `agy 1.5.10`'s exact middle-cut formula
+ * and saves the full output to `outputTxtPath`.
+ */
+export function truncateAndPersistOutput(fullText: string, outputTxtPath: string): string {
+  const fullBuf = Buffer.from(fullText, "utf8");
+  mkdirSync(join(outputTxtPath, ".."), { recursive: true });
+  writeFileSync(outputTxtPath, fullBuf);
+
+  const totalBytes = fullBuf.length;
+  if (totalBytes <= MAX_TOOL_OUTPUT_BYTES) {
+    return fullText;
+  }
+
+  const fileUri = encodeFileUri(outputTxtPath);
+  const prefix =
+    `The tool's output was truncated due to being too long. You can find the full output in a file at ${fileUri}.\n\n` +
+    "Here is a preview with the middle of the output truncated:\n";
+  const prefixBytes = Buffer.byteLength(prefix, "utf8");
+  const digitsY = String(totalBytes).length;
+  const half = Math.max(64, Math.floor((10_186 - prefixBytes - 2 * digitsY) / 2));
+
+  const head = trimHeadUtf8(fullBuf, half);
+  const tail = trimTailUtf8(fullBuf, half);
+  const removed = totalBytes - Buffer.byteLength(head, "utf8") - Buffer.byteLength(tail, "utf8");
+
+  return `${prefix}${head}\n<truncated ${removed} of ${totalBytes} bytes from the middle of the output>\n${tail}`;
+}
+
+/**
+ * Builds the 1,000-byte UTF-8-safe tail preview with `<truncated N lines>` marker.
+ */
+export function buildTailLogPreview(cleanBytes: Buffer): string {
+  if (cleanBytes.length === 0) return "";
+  if (cleanBytes.length <= TAIL_PREVIEW_BYTES) {
+    return cleanBytes.toString("utf8");
+  }
+  const tailStr = trimTailUtf8(cleanBytes, TAIL_PREVIEW_BYTES);
+  const shownBytes = Buffer.byteLength(tailStr, "utf8");
+  const dropped = cleanBytes.subarray(0, cleanBytes.length - shownBytes);
+  let newlines = 0;
+  for (let i = 0; i < dropped.length; i += 1) {
+    if (dropped[i] === 0x0a) newlines += 1;
+  }
+  const droppedLines = newlines + (dropped.length > 0 && dropped[dropped.length - 1] !== 0x0a ? 1 : 0);
+  return (droppedLines > 0 ? `<truncated ${droppedLines} lines>\n` : "") + tailStr;
+}
+
+function formatGoStyleDurationSeconds(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1_000));
+  if (totalSec < 60) return `${totalSec}s`;
+  const hours = Math.floor(totalSec / 3_600);
+  const mins = Math.floor((totalSec % 3_600) / 60);
+  const secs = totalSec % 60;
+  if (hours > 0) return `${hours}h${mins}m${secs}s`;
+  return `${mins}m${secs}s`;
+}
+
+function collectDescendantPids(rootPid: number): number[] {
+  if (process.platform === "win32") return [];
+  const found: number[] = [];
+  const queue = [rootPid];
+  const seen = new Set<number>([rootPid]);
+  while (queue.length > 0) {
+    const parent = queue.shift()!;
+    try {
+      const out = execFileSync("pgrep", ["-P", String(parent)], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 500,
+      }).trim();
+      if (!out) continue;
+      for (const line of out.split(/\s+/)) {
+        const pid = Number(line);
+        if (Number.isInteger(pid) && pid > 1 && !seen.has(pid)) {
+          seen.add(pid);
+          found.push(pid);
+          queue.push(pid);
+        }
+      }
+    } catch {
+      // no children
+    }
+  }
+  return found;
+}
+
+function killProcessTreeHard(shellPid: number | undefined, wrapperProc: ChildProcess): void {
+  const targetPid = shellPid ?? wrapperProc.pid;
+  if (targetPid && process.platform !== "win32") {
+    const descendants = collectDescendantPids(targetPid);
+    try {
+      process.kill(-targetPid, "SIGKILL");
+    } catch {
+      // ignore ESRCH
+    }
+    for (const dpid of descendants.reverse()) {
+      try {
+        process.kill(dpid, "SIGKILL");
+      } catch {
+        // ignore ESRCH
+      }
+    }
+  }
+  try {
+    wrapperProc.kill("SIGKILL");
+  } catch {
+    // ignore
+  }
+}
+
+export type TaskStatusEnum = "RUNNING" | "DONE" | "CANCELED";
+
+export interface SessionNoticeItem {
+  ts: string;
+  sender: string;
+  text: string;
+  delivered: boolean;
+}
+
+export interface ManagedTaskRecord {
+  taskId: string;
+  stepIndex: number;
+  commandLine: string;
+  toolSummary: string;
+  isDaemon: boolean;
+  startTimeIsoUtc: string;
+  lastProgressMs: number;
+  status: TaskStatusEnum;
+  exitCode: number;
+  terminatedBySignal: number | null;
+  killedByUser: boolean;
+  logPath: string;
+  logUri: string;
+  stepOutputPath: string;
+  cleanChunks: Buffer[];
+  cleanByteLength: number;
+  proc: ChildProcess;
+  shellPid?: number;
+  backgrounded: boolean;
+  fullResultDeliveredViaStatus: boolean;
+  waiters: Set<() => void>;
+}
+
+export interface SessionTaskContext {
+  readonly sessionUuid: string;
+  readonly stateRoot: string;
+  readonly workspace: string;
+  nextStepIndex(): number;
+  currentStepCount(): number;
+  readonly tasksByStep: Map<number, ManagedTaskRecord>;
+  pushNotice(notice: SessionNoticeItem): void;
+  markNoticeDelivered(sender: string): void;
+}
+
+function buildCommandEnv(workspace: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    PWD: workspace,
+    TERM: "dumb",
+    COLUMNS: "80",
+    LINES: "24",
+    PAGER: "cat",
+    GIT_PAGER: "cat",
+    JJ_PAGER: "cat",
+    GIT_EDITOR: "false",
+    HGEDITOR: "false",
+    JJ_EDITOR: "false",
+  };
+}
+
+function formatCompletedCommandBody(exitCode: number, cleanOutput: string, includeTimestamps?: { created: string; completed: string }): string {
+  const header = includeTimestamps
+    ? `Created At: ${includeTimestamps.created}\nCompleted At: ${includeTimestamps.completed}\n`
+    : "";
+  const payload =
+    cleanOutput.length > 0 ? `Command output:\n${cleanOutput}` : "No output from the command.";
+  return `${header}Command exited with code ${exitCode}.\n\n${payload}`;
+}
+
+export async function executeRunCommand(
+  ctx: SessionTaskContext,
+  args: Record<string, unknown>,
+  holdMs: number,
+): Promise<{ text: string; isError?: boolean }> {
+  const commandLine = String(args.CommandLine ?? "");
+  if (commandLine === "") {
+    throw new AgyToolExecutionError("run_command: CommandLine is required");
+  }
+  const toolSummary = String(args.toolSummary ?? "");
+  const isDaemon = args.IsDaemon === true;
+  const waitMsRaw = typeof args.WaitMsBeforeAsync === "number" ? args.WaitMsBeforeAsync : 5_000;
+  const agyClampedWaitMs = Math.min(10_000, Math.max(500, waitMsRaw));
+  const wantsServerHold = !isDaemon && waitMsRaw > 500;
+  const effectiveWaitMs = wantsServerHold ? Math.max(agyClampedWaitMs, holdMs) : agyClampedWaitMs;
+
+  const stepIndex = ctx.nextStepIndex();
+  const taskId = `${ctx.sessionUuid}/task-${stepIndex}`;
+  const tasksDir = join(ctx.stateRoot, "brain", ctx.sessionUuid, ".system_generated", "tasks");
+  const stepOutputPath = join(
+    ctx.stateRoot,
+    "brain",
+    ctx.sessionUuid,
+    ".system_generated",
+    "steps",
+    String(stepIndex),
+    "output.txt",
+  );
+  mkdirSync(tasksDir, { recursive: true });
+  const logPath = join(tasksDir, `task-${stepIndex}.log`);
+  writeFileSync(logPath, "");
+
+  const createdLocal = formatAgyTimestamp();
+  const startUtc = formatAgyUtcTimestamp();
+  const env = buildCommandEnv(ctx.workspace);
+  const pyBin = detectPythonPtyBin();
+
+  let proc: ChildProcess;
+  if (pyBin) {
+    proc = spawn(pyBin, ["-c", PYTHON_PTY_SHIM, commandLine], {
+      cwd: ctx.workspace,
+      env,
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+    });
+  } else {
+    const shell =
+      process.platform === "win32"
+        ? process.env.COMSPEC || "cmd.exe"
+        : existsSync("/bin/zsh")
+          ? "/bin/zsh"
+          : process.env.SHELL || "/bin/sh";
+    const shellArgs = process.platform === "win32" ? ["/d", "/s", "/c", commandLine] : ["-c", commandLine];
+    proc = spawn(shell, shellArgs, {
+      cwd: ctx.workspace,
+      env,
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  }
+
+  const record: ManagedTaskRecord = {
+    taskId,
+    stepIndex,
+    commandLine,
+    toolSummary,
+    isDaemon,
+    startTimeIsoUtc: startUtc,
+    lastProgressMs: Date.now(),
+    status: "RUNNING",
+    exitCode: 0,
+    terminatedBySignal: null,
+    killedByUser: false,
+    logPath,
+    logUri: encodeFileUri(logPath),
+    stepOutputPath,
+    cleanChunks: [],
+    cleanByteLength: 0,
+    proc,
+    shellPid: pyBin ? undefined : proc.pid,
+    backgrounded: false,
+    fullResultDeliveredViaStatus: false,
+    waiters: new Set(),
+  };
+
+  const onChunk = (chunk: Buffer) => {
+    const cleaned = stripAnsiAndDecode(chunk);
+    if (cleaned.length === 0) return;
+    const cleanBuf = Buffer.from(cleaned, "utf8");
+    record.cleanChunks.push(cleanBuf);
+    record.cleanByteLength += cleanBuf.length;
+    record.lastProgressMs = Date.now();
+    try {
+      appendFileSync(logPath, cleanBuf);
+    } catch {
+      // ignore disk errors after teardown
+    }
+  };
+
+  proc.stdout?.on("data", onChunk);
+  proc.stderr?.on("data", onChunk);
+
+  if (pyBin && proc.stdio[3]) {
+    let ctrlBuf = "";
+    proc.stdio[3].on("data", (d: Buffer) => {
+      ctrlBuf += d.toString("utf8");
+      let nl: number;
+      while ((nl = ctrlBuf.indexOf("\n")) >= 0) {
+        const line = ctrlBuf.slice(0, nl).trim();
+        ctrlBuf = ctrlBuf.slice(nl + 1);
+        if (line.startsWith("PID:")) {
+          const parsedPid = Number(line.slice(4));
+          if (Number.isInteger(parsedPid) && parsedPid > 0) {
+            record.shellPid = parsedPid;
+          }
+        } else if (line.startsWith("SIG:")) {
+          const sigNum = Number(line.slice(4));
+          if (Number.isInteger(sigNum) && sigNum > 0) {
+            record.terminatedBySignal = sigNum;
+          }
+        }
+      }
+    });
+  }
+
+  const exitPromise = new Promise<void>((resolveExit) => {
+    proc.once("close", (code, signal) => {
+      if (record.killedByUser) {
+        record.status = "CANCELED";
+      } else if (
+        signal === "SIGINT"
+        || signal === "SIGTERM"
+        || record.terminatedBySignal === 2
+        || record.terminatedBySignal === 15
+      ) {
+        record.status = "CANCELED";
+      } else {
+        record.status = "DONE";
+      }
+
+      if (typeof code === "number") {
+        record.exitCode = code;
+      } else if (signal) {
+        record.exitCode = 128;
+      }
+
+      if (record.backgrounded) {
+        const tsUtc = formatAgyUtcTimestamp();
+        if (record.status === "CANCELED") {
+          ctx.pushNotice({
+            ts: tsUtc,
+            sender: record.taskId,
+            text: `Task id "${record.taskId}" was canceled with result:\nTool execution was canceled\nLog: ${record.logUri}`,
+            delivered: false,
+          });
+        } else {
+          const cleanOut = Buffer.concat(record.cleanChunks).toString("utf8");
+          const rawBody = formatCompletedCommandBody(record.exitCode, cleanOut);
+          const truncatedBody = truncateAndPersistOutput(rawBody, record.stepOutputPath);
+          ctx.pushNotice({
+            ts: tsUtc,
+            sender: record.taskId,
+            text: `Task id "${record.taskId}" finished with result:\n${truncatedBody}\nLog: ${record.logUri}`,
+            delivered: false,
+          });
+        }
+      }
+
+      for (const w of [...record.waiters]) w();
+      record.waiters.clear();
+      resolveExit();
+    });
+  });
+
+  // Wait up to effectiveWaitMs for synchronous completion
+  const finishedInTime = await Promise.race([
+    exitPromise.then(() => true),
+    new Promise<boolean>((resolveTimer) => {
+      const t = setTimeout(() => resolveTimer(false), effectiveWaitMs);
+      void exitPromise.finally(() => clearTimeout(t));
+    }),
+  ]);
+
+  if (finishedInTime) {
+    if (record.status === "CANCELED") {
+      return { text: "Tool execution was canceled", isError: true };
+    }
+    const completedLocal = formatAgyTimestamp();
+    const cleanOut = Buffer.concat(record.cleanChunks).toString("utf8");
+    const fullFormatted = formatCompletedCommandBody(record.exitCode, cleanOut, {
+      created: createdLocal,
+      completed: completedLocal,
+    });
+    return {
+      text: truncateAndPersistOutput(fullFormatted, record.stepOutputPath),
+    };
+  }
+
+  // Transition to background task
+  record.backgrounded = true;
+  ctx.tasksByStep.set(stepIndex, record);
+
+  const currentCleanBytes = Buffer.concat(record.cleanChunks);
+  const preview = buildTailLogPreview(currentCleanBytes);
+  let out =
+    `Tool is running as a background task with task id: ${record.taskId}\n` +
+    `Task logs are available at: ${record.logUri}`;
+  if (preview.length > 0) {
+    out += `\nLog output:\n${preview}`;
+  }
+  if (wantsServerHold) {
+    const holdSec = Math.round(holdMs / 1_000);
+    out += `\n\n[Server held ${holdSec}s; task is still running. Call manage_task with Action "status" and TaskId "${record.taskId}" to wait up to another ${holdSec}s.]`;
+  }
+
+  return { text: out };
+}
+
+function parseTaskIdForSession(
+  rawTaskId: string,
+  ctx: SessionTaskContext,
+): { resolvedId: string; stepIndex: number } {
+  if (!rawTaskId) {
+    throw new AgyToolExecutionError(
+      'TaskId is required for this action; run the "list" action to get the ids of the running tasks',
+    );
+  }
+
+  let localPart: string;
+  if (rawTaskId.includes("/")) {
+    const parts = rawTaskId.split("/");
+    if (parts.length !== 2) {
+      throw new AgyToolExecutionError(`invalid local task ID format: "${parts.slice(1).join("/")}"`);
+    }
+    const [sid, rest] = parts as [string, string];
+    if (sid !== ctx.sessionUuid) {
+      throw new AgyToolExecutionError(`task "${rawTaskId}" belongs to a different conversation`);
+    }
+    if (!rest) {
+      throw new AgyToolExecutionError('invalid local task ID format: ""');
+    }
+    localPart = rest;
+  } else {
+    if (!rawTaskId.startsWith("task-")) {
+      throw new AgyToolExecutionError(`invalid task ID format: "${rawTaskId}"`);
+    }
+    localPart = rawTaskId;
+  }
+
+  if (!localPart.startsWith("task-")) {
+    throw new AgyToolExecutionError(`invalid local task ID format: "${localPart}"`);
+  }
+
+  const numStr = localPart.slice("task-".length);
+  if (!/^[+-]?\d+$/.test(numStr)) {
+    throw new AgyToolExecutionError(
+      `invalid step index in local task ID "${localPart}": strconv.Atoi: parsing "${numStr}": invalid syntax`,
+    );
+  }
+  const stepIndex = Number(numStr);
+  if (!Number.isSafeInteger(stepIndex)) {
+    throw new AgyToolExecutionError(
+      `invalid step index in local task ID "${localPart}": strconv.Atoi: parsing "${numStr}": value out of range`,
+    );
+  }
+
+  return {
+    resolvedId: `${ctx.sessionUuid}/task-${stepIndex}`,
+    stepIndex,
+  };
+}
+
+function waitOnTaskRecord(record: ManagedTaskRecord, timeoutMs: number): Promise<void> {
+  if (record.status !== "RUNNING") return Promise.resolve();
+  return new Promise((resolveWait) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      record.waiters.delete(finish);
+      resolveWait();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    record.waiters.add(finish);
+  });
+}
+
+export async function executeManageTask(
+  ctx: SessionTaskContext,
+  args: Record<string, unknown>,
+  holdMs: number,
+): Promise<{ text: string; suppressNoticeTaskId?: string }> {
+  const action = String(args.Action ?? "");
+  const created = formatAgyTimestamp();
+
+  if (action === "list") {
+    const running = [...ctx.tasksByStep.values()]
+      .filter((t) => t.status === "RUNNING")
+      .sort((a, b) => a.stepIndex - b.stepIndex);
+    const completed = formatAgyTimestamp();
+    if (running.length === 0) {
+      return {
+        text: `Created At: ${created}\nCompleted At: ${completed}\nNo background tasks are currently running.`,
+      };
+    }
+    const items = running.map((t) => ({
+      taskId: t.taskId,
+      toolName: "run_command",
+      toolSummary: t.toolSummary,
+      description: t.commandLine,
+      startTime: t.startTimeIsoUtc,
+      logUri: t.logUri,
+      ...(t.isDaemon ? { isDaemon: true } : {}),
+    }));
+    return {
+      text:
+        `Created At: ${created}\nCompleted At: ${completed}\n` +
+        `You have ${running.length} background task(s) currently running:\n` +
+        JSON.stringify(items),
+    };
+  }
+
+  const rawTaskId = typeof args.TaskId === "string" ? args.TaskId : "";
+  const { resolvedId, stepIndex } = parseTaskIdForSession(rawTaskId, ctx);
+  const totalSteps = ctx.currentStepCount();
+  const record = ctx.tasksByStep.get(stepIndex);
+
+  if (action === "status") {
+    if (!record) {
+      if (stepIndex < 0 || stepIndex > totalSteps) {
+        throw new AgyToolExecutionError(
+          `task "${resolvedId}" refers to a non-existent step index ${stepIndex} (total steps: ${totalSteps})`,
+        );
+      }
+      const completed = formatAgyTimestamp();
+      return {
+        text: `Created At: ${created}\nCompleted At: ${completed}\nTask: ${resolvedId}\nStatus: DONE\n`,
+      };
+    }
+
+    if (record.status === "RUNNING" && holdMs > 0) {
+      await waitOnTaskRecord(record, holdMs);
+    }
+
+    // Deliver the full result (including exact exit code) the first time status observes completion
+    if (record.status === "DONE" && !record.fullResultDeliveredViaStatus) {
+      record.fullResultDeliveredViaStatus = true;
+      ctx.markNoticeDelivered(record.taskId);
+      const cleanOut = Buffer.concat(record.cleanChunks).toString("utf8");
+      const rawBody = formatCompletedCommandBody(record.exitCode, cleanOut);
+      const truncatedBody = truncateAndPersistOutput(rawBody, record.stepOutputPath);
+      return {
+        text: `Task id "${record.taskId}" finished with result:\n${truncatedBody}\nLog: ${record.logUri}`,
+        suppressNoticeTaskId: record.taskId,
+      };
+    }
+
+    const completed = formatAgyTimestamp();
+    const cleanBytes = Buffer.concat(record.cleanChunks);
+    const preview = buildTailLogPreview(cleanBytes);
+    let out =
+      `Created At: ${created}\nCompleted At: ${completed}\n` +
+      `Task: ${record.taskId}\n` +
+      `Status: ${record.status}\n` +
+      `Log: ${record.logUri}\n`;
+    if (preview.length > 0) {
+      const ago = formatGoStyleDurationSeconds(Date.now() - record.lastProgressMs);
+      out += `Log output:\n${preview}\nLast progress: ${ago} ago\n`;
+    }
+    if (record.status === "RUNNING" && holdMs > 0) {
+      const holdSec = Math.round(holdMs / 1_000);
+      out += `\n[Server held ${holdSec}s; task is still running. Call manage_task with Action "status" and TaskId "${record.taskId}" to wait up to another ${holdSec}s.]`;
+    }
+    return { text: out, suppressNoticeTaskId: record.taskId };
+  }
+
+  if (action === "send_input") {
+    const input = typeof args.Input === "string" ? args.Input : "";
+    if (input === "") {
+      throw new AgyToolExecutionError('Input is required for the "send_input" action');
+    }
+    if (!record) {
+      throw new AgyToolExecutionError(
+        `task "${resolvedId}" refers to a non-existent step index ${stepIndex} (total steps: ${totalSteps})`,
+      );
+    }
+    if (record.status !== "RUNNING") {
+      throw new AgyToolExecutionError(
+        `cannot send_input task "${record.taskId}": task is not running (status: ${record.status})`,
+      );
+    }
+    if (!record.proc.stdin || record.proc.stdin.destroyed || !record.proc.stdin.writable) {
+      throw new AgyToolExecutionError(`cannot send_input task "${record.taskId}": stdin is closed`);
+    }
+    record.proc.stdin.write(Buffer.from(input, "utf8"));
+    const completed = formatAgyTimestamp();
+    return {
+      text: `Created At: ${created}\nCompleted At: ${completed}\nInput sent to task "${record.taskId}".`,
+    };
+  }
+
+  if (action === "kill") {
+    if (!record) {
+      throw new AgyToolExecutionError(
+        `task "${resolvedId}" refers to a non-existent step index ${stepIndex} (total steps: ${totalSteps})`,
+      );
+    }
+    if (record.status !== "RUNNING") {
+      throw new AgyToolExecutionError(
+        `cannot kill task "${record.taskId}": task is not running (status: ${record.status})`,
+      );
+    }
+    record.killedByUser = true;
+    killProcessTreeHard(record.shellPid, record.proc);
+    await waitOnTaskRecord(record, 1_500);
+    record.status = "CANCELED";
+    const completed = formatAgyTimestamp();
+    return {
+      text: `Created At: ${created}\nCompleted At: ${completed}\nTask "${record.taskId}" cancelled.`,
+      suppressNoticeTaskId: record.taskId,
+    };
+  }
+
+  throw new AgyToolExecutionError(`unsupported action: ${action}`);
+}
+
+export function killAllSessionTasks(tasksByStep: Map<number, ManagedTaskRecord>): void {
+  for (const record of tasksByStep.values()) {
+    if (record.status === "RUNNING") {
+      record.killedByUser = true;
+      killProcessTreeHard(record.shellPid, record.proc);
+      record.status = "CANCELED";
+      for (const w of [...record.waiters]) w();
+      record.waiters.clear();
+    }
+  }
+}

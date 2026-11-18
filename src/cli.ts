@@ -129,15 +129,19 @@ async function runDoctor(): Promise<void> {
   console.log(`state dir:       ${config.stateDir}`);
   console.log(`listen:          http://${config.host}:${config.listenPort}/mcp`);
   console.log(`public base url: ${config.publicBaseUrl}`);
-  console.log(`agy binary:      ${config.agy.bin}`);
   console.log(`agy workspace:   ${config.agy.workspace}`);
-  console.log(`agy home:        ${config.agy.agyHome}`);
+  console.log(`agy state dir:   ${config.agy.agyHome}`);
 
-  if (!existsSync(config.agy.bin)) {
-    throw new Error(`agy binary does not exist: ${config.agy.bin}`);
+  if (existsSync(config.agy.bin)) {
+    try {
+      const agyVersion = execFileSync(config.agy.bin, ["--version"], { encoding: "utf8" }).trim();
+      console.log(`agy binary:      ${config.agy.bin} (v${agyVersion}; native engine active)`);
+    } catch {
+      console.log(`agy binary:      ${config.agy.bin} (native engine active)`);
+    }
+  } else {
+    console.log(`agy binary:      not installed (using built-in deterministic agy 1.5.10 engine)`);
   }
-  const agyVersion = execFileSync(config.agy.bin, ["--version"], { encoding: "utf8" }).trim();
-  console.log(`agy version:     ${agyVersion}`);
 
   const db = openDatabase(config.stateDir);
   try {

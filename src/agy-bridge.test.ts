@@ -1,19 +1,17 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { AgyBridge } from "./agy-bridge.js";
 import { devspaceConfigSchema } from "./config-schema.js";
 import type { ServerConfig } from "./config.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { cleanGeminiToolSchema } from "./schema-clean.js";
 import { createServer } from "./server.js";
-
-const DEFAULT_AGY_BIN = join(homedir(), ".local", "bin", "agy");
 
 // Minimal valid 1x1 red PNG
 const TINY_PNG_BASE64 =
@@ -72,7 +70,6 @@ test("config schema accepts legacy Synrex keys and defaults refreshTokenGraceSec
 
 test(
   "end-to-end AGY MCP bridge: tools, PNG read, multi-subagent concurrency, 10s+ single-call hold, and session isolation",
-  { skip: !existsSync(DEFAULT_AGY_BIN) },
   async (t: TestContext) => {
     const root = await mkdtemp(join(tmpdir(), "devspace-agy-e2e-"));
     t.after(() => rm(root, { recursive: true, force: true }));
@@ -109,7 +106,7 @@ test(
         allowedRedirectHosts: ["localhost", "127.0.0.1"],
       },
       agy: {
-        bin: DEFAULT_AGY_BIN,
+        bin: "/nonexistent/agy-binary-not-required",
         workspace,
         agyHome,
         modelId: "gemini-3.1-pro-preview",
@@ -436,3 +433,220 @@ test(
     assert.equal(staleResp.status, 200);
   },
 );
+
+test("deterministic agy 1.5.10 parity contracts: validation, read_file pagination, write/edit semantics, PTY & process-group kill", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-agy-contracts-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const workspace = join(root, "ws");
+  const agyHome = join(root, "state");
+
+  const bridge = new AgyBridge(
+    {
+      bin: "/nonexistent/agy",
+      workspace,
+      agyHome,
+      modelId: "unused",
+      wireProtocol: "genai",
+      holdMs: 2_500,
+      callTimeoutMs: 10_000,
+      maxTurnsPerSession: 80,
+      sessionIdleTtlMs: 600_000,
+      exposedTools: ["read_file", "write_file", "edit_file", "run_command", "manage_task"],
+    },
+    {
+      level: "error",
+      format: "json",
+      requests: false,
+      assets: false,
+      toolCalls: false,
+      shellCommands: false,
+      trustProxy: false,
+    },
+  );
+  await bridge.start();
+  t.after(() => bridge.close());
+
+  // 1. Cleaned schema normalizes string minLength: "1" -> number 1
+  const tools = await bridge.listTools();
+  const writeSchema = tools.find((tl) => tl.name === "write_file")!.inputSchema;
+  const writeProps = writeSchema.properties as Record<string, Record<string, unknown>>;
+  assert.equal(writeProps.Path?.minLength, 1);
+
+  // 2. Strict validation errors match agy 1.5.10 format
+  const valErr = await bridge.callTool("s1", "write_file", { Path: "", Extra: 1 } as Record<string, unknown>);
+  assert.equal(valErr.isError, true);
+  const valTxt = (valErr.content[0] as { text: string }).text;
+  assert.match(valTxt, /^Encountered error in tool validation: invalid arguments:/);
+  assert.match(valTxt, /missing property 'Content'/);
+  assert.match(valTxt, /additional properties 'Extra' not allowed/);
+  assert.match(valTxt, /at '\/Path': minLength: got 0, want 1/);
+
+  // 3. write_file: create, conflict without Overwrite, Append auto-newline, and mode preservation
+  const f1 = join(workspace, "sub/dir/notes.sh");
+  const w1 = await bridge.callTool("s1", "write_file", { Path: f1, Content: "first" });
+  assert.equal(w1.isError, undefined);
+  assert.match((w1.content[0] as { text: string }).text, /Created file\.$/);
+  await chmod(f1, 0o755);
+
+  const wConflict = await bridge.callTool("s1", "write_file", { Path: f1, Content: "nope" });
+  assert.equal(wConflict.isError, true);
+  assert.match((wConflict.content[0] as { text: string }).text, /already exists\. To overwrite it, retry with Overwrite=true/);
+
+  const wBoth = await bridge.callTool("s1", "write_file", {
+    Path: f1,
+    Content: "x",
+    Overwrite: true,
+    Append: true,
+  });
+  assert.equal(wBoth.isError, true);
+  assert.match((wBoth.content[0] as { text: string }).text, /Overwrite and Append cannot both be true/);
+
+  const wAppend = await bridge.callTool("s1", "write_file", { Path: f1, Content: "second", Append: true });
+  assert.equal(wAppend.isError, undefined);
+  assert.equal(await readFile(f1, "utf8"), "first\nsecond");
+  assert.equal((await stat(f1)).mode & 0o777, 0o755);
+
+  // 4. edit_file: multi-occurrence non-overlapping, CRLF normalization, regex metachar safety, LCS +A/-R
+  const crlfPath = join(workspace, "crlf.txt");
+  await writeFile(crlfPath, "line1\r\nfoo\r\nfoo\r\nend\r\n");
+  const edRes = await bridge.callTool("s1", "edit_file", {
+    Path: crlfPath,
+    Target: "foo",
+    Replacement: "BAR_$&_1\nBAR_2",
+  });
+  assert.equal(edRes.isError, undefined);
+  assert.match(
+    (edRes.content[0] as { text: string }).text,
+    /Made 2 replacements in .*crlf\.txt starting at line 2 \(\+4\/-2 lines\)\./,
+  );
+  assert.equal(await readFile(crlfPath, "utf8"), "line1\r\nBAR_$&_1\r\nBAR_2\r\nBAR_$&_1\r\nBAR_2\r\nend\r\n");
+
+  // 5. read_file: empty file, no-trailing-newline marker, 800-line cap, 46080-byte rendered window + ByteOffset continuation, binary rejection
+  const emptyPath = join(workspace, "empty.txt");
+  await writeFile(emptyPath, "");
+  const rEmpty = await bridge.callTool("s1", "read_file", { Path: emptyPath });
+  assert.match((rEmpty.content[0] as { text: string }).text, /File is empty$/);
+
+  const rNoNl = await bridge.callTool("s1", "read_file", { Path: f1 });
+  assert.match((rNoNl.content[0] as { text: string }).text, /\(no newline at end of file\)$/);
+
+  const thousandLines = join(workspace, "1000.txt");
+  await writeFile(
+    thousandLines,
+    Array.from({ length: 1000 }, (_, i) => `row-${i + 1}`).join("\n") + "\n",
+  );
+  const rCap = await bridge.callTool("s1", "read_file", { Path: thousandLines });
+  assert.match((rCap.content[0] as { text: string }).text, /Showing lines 1-800 of 1000\n1: row-1/);
+
+  const widePath = join(workspace, "wide.txt");
+  await writeFile(
+    widePath,
+    Array.from({ length: 100 }, (_, i) => `L${i + 1}:${"X".repeat(600)}`).join("\n") + "\n",
+  );
+  const rPart1 = await bridge.callTool("s1", "read_file", { Path: widePath, StartLine: 1, EndLine: 100 });
+  const part1Text = (rPart1.content[0] as { text: string }).text;
+  const nextOffMatch = part1Text.match(/ByteOffset=(\d+)/);
+  assert.ok(nextOffMatch, "Expected ByteOffset continuation hint");
+  const nextOff = Number(nextOffMatch[1]);
+  const rPart2 = await bridge.callTool("s1", "read_file", {
+    Path: widePath,
+    StartLine: 1,
+    EndLine: 100,
+    ByteOffset: nextOff,
+  });
+  const part2Text = (rPart2.content[0] as { text: string }).text;
+  assert.match(part2Text, new RegExp(`Showing bytes ${nextOff}-\\d+ of \\d+ in this line range\\.`));
+
+  const binPath = join(workspace, "raw.bin");
+  await writeFile(binPath, Buffer.from([0x00, 0xff, 0xfe, 0x01]));
+  const rBin = await bridge.callTool("s1", "read_file", { Path: binPath });
+  assert.equal(rBin.isError, true);
+  assert.match((rBin.content[0] as { text: string }).text, /appears to be a binary file/);
+
+  // 6. run_command: true PTY (isatty + CRLF), real user HOME inheritance, and 10,240-byte middle truncation
+  const ptyCheck = await bridge.callTool("s1", "run_command", {
+    CommandLine: '[ -t 0 ] && [ -t 1 ] && [ -t 2 ] && echo "PTY_OK HOME=$HOME"',
+    WaitMsBeforeAsync: 5000,
+    toolSummary: "Verify PTY and HOME",
+  });
+  const ptyTxt = (ptyCheck.content[0] as { text: string }).text;
+  assert.match(ptyTxt, /PTY_OK HOME=/);
+  assert.equal(ptyTxt.includes(`HOME=${agyHome}`), false, "Should inherit real user HOME rather than isolated agyHome");
+  assert.ok(ptyTxt.includes("\r\n"), "PTY output should preserve CRLF line endings");
+
+  const bigRes = await bridge.callTool("s1", "run_command", {
+    CommandLine: "python3 -c 'print(\"Z\" * 15000)'",
+    WaitMsBeforeAsync: 5000,
+    toolSummary: "Big output",
+  });
+  const bigTxt = (bigRes.content[0] as { text: string }).text;
+  assert.match(bigTxt, /<truncated \d+ of \d+ bytes from the middle of the output>/);
+  const fileUrlMatch = bigTxt.match(/file:\/\/([^\s]+output\.txt)\./);
+  assert.ok(fileUrlMatch);
+  const savedFull = await readFile(new URL(`file://${fileUrlMatch[1]}`), "utf8");
+  assert.ok(savedFull.length > 15_000);
+
+  // 7. manage_task: interactive send_input + hard process-group kill + cross-session isolation
+  const bgInteractive = await bridge.callTool("s1", "run_command", {
+    CommandLine: "python3 -u -c 'import sys; line = sys.stdin.readline().strip(); print(\"ECHO:\" + line)'",
+    WaitMsBeforeAsync: 500,
+    IsDaemon: true,
+    toolSummary: "Interactive reader",
+  });
+  const interactiveId = (bgInteractive.content[0] as { text: string }).text.match(/task id: (\S+)/)![1]!;
+
+  // Cross-session isolation check
+  const wrongSessionRes = await bridge.callTool("s2", "manage_task", {
+    Action: "status",
+    TaskId: interactiveId,
+  });
+  assert.equal(wrongSessionRes.isError, true);
+  assert.match((wrongSessionRes.content[0] as { text: string }).text, /belongs to a different conversation/);
+
+  const sendRes = await bridge.callTool("s1", "manage_task", {
+    Action: "send_input",
+    TaskId: interactiveId,
+    Input: "hello_pty\n",
+  });
+  assert.match((sendRes.content[0] as { text: string }).text, /Input sent to task/);
+
+  const interactiveDone = await bridge.callTool("s1", "manage_task", {
+    Action: "status",
+    TaskId: interactiveId,
+  });
+  assert.match((interactiveDone.content[0] as { text: string }).text, /ECHO:hello_pty/);
+
+  // Process-group kill check (no orphan child processes)
+  const pidFile = join(workspace, "child.pid");
+  const bgTree = await bridge.callTool("s1", "run_command", {
+    CommandLine: `python3 -c 'import os, subprocess, time; p = subprocess.Popen(["sleep", "60"]); open(${JSON.stringify(pidFile)}, "w").write(str(p.pid)); time.sleep(60)'`,
+    WaitMsBeforeAsync: 600,
+    IsDaemon: true,
+    toolSummary: "Spawn child sleeper",
+  });
+  const treeTaskId = (bgTree.content[0] as { text: string }).text.match(/task id: (\S+)/)![1]!;
+  const childPid = Number((await readFile(pidFile, "utf8")).trim());
+  assert.ok(childPid > 1);
+
+  const killRes = await bridge.callTool("s1", "manage_task", {
+    Action: "kill",
+    TaskId: treeTaskId,
+  });
+  assert.match((killRes.content[0] as { text: string }).text, /cancelled\.$/);
+
+  let childAlive = true;
+  try {
+    process.kill(childPid, 0);
+  } catch {
+    childAlive = false;
+  }
+  assert.equal(childAlive, false, "Descendant sleep process must be killed with the task");
+
+  const killAgain = await bridge.callTool("s1", "manage_task", {
+    Action: "kill",
+    TaskId: treeTaskId,
+  });
+  assert.equal(killAgain.isError, true);
+  assert.match((killAgain.content[0] as { text: string }).text, /task is not running \(status: CANCELED\)/);
+});
