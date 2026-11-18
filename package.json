@@ -1,10 +1,10 @@
 {
-  "name": "@waishnav/devspace",
-  "version": "1.1.1",
-  "description": "Gemini Web AGY MCP Bridge server with OAuth 2.1.",
+  "name": "gemini-space",
+  "version": "1.0.0",
+  "description": "Gemini Web AGY MCP server with OAuth 2.1, deterministic local tools, Code Mode, and Skills.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cunninghamcard-bit/synrex.git"
+    "url": "git+https://github.com/cunninghamcard-bit/gemini-space.git"
   },
   "type": "module",
   "main": "dist/server.js",
