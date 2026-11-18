@@ -52,6 +52,20 @@ export function migrateDatabase(sqlite: SqliteDatabase): void {
 
       create index if not exists oauth_refresh_tokens_expires_at_idx
         on oauth_refresh_tokens(expires_at);
+
+      create table if not exists mcp_activity_calls (
+        id integer primary key autoincrement,
+        created_at text not null,
+        mcp_session_id text not null,
+        tool text not null,
+        args_json text not null,
+        output_preview text not null,
+        duration_ms integer not null,
+        is_error integer not null default 0
+      );
+
+      create index if not exists mcp_activity_calls_session_idx
+        on mcp_activity_calls(mcp_session_id, id desc);
     `);
 
     const hasOAuthMigration = sqlite

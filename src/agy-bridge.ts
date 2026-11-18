@@ -129,16 +129,31 @@ interface AgyRuntime {
   close(): Promise<void>;
 }
 
-export function buildServerInstructions(holdMs: number): string {
+export function buildServerInstructions(
+  holdMs: number,
+  options: { skillsSection?: string; codeModeEnabled?: boolean } = {},
+): string {
   const holdSeconds = Math.round(holdMs / 1000);
-  return [
+  const parts = [
     "These tools run directly on the owner's Mac through Antigravity (agy) with full local filesystem and zsh permissions.",
     "Always pass absolute file paths to read_file, write_file, and edit_file; no workspace-open step is needed.",
     "Before making changes in an unfamiliar repository, check whether AGENTS.md or CLAUDE.md exists at its root with read_file and follow its rules.",
     `Non-daemon run_command calls automatically wait on the server for up to ${holdSeconds} seconds so most commands finish in one call.`,
     `If run_command exceeds ${holdSeconds} seconds and returns a background task id, call manage_task with Action "status" and that TaskId: the server holds each status check up to ${holdSeconds} seconds until the task finishes. Repeat until completion when your task depends on the output.`,
     "Completion notices for background tasks in your session are also appended to subsequent tool results.",
-  ].join(" ");
+  ];
+
+  if (options.codeModeEnabled) {
+    parts.push(
+      "When you need to chain or fan out many local file/command operations in a single turn, prefer `execute` (Code Mode) to run an async JS snippet calling `tools.read_file` / `tools.edit_file` / `tools.run_command` and return the aggregated result.",
+    );
+  }
+
+  if (options.skillsSection) {
+    parts.push(options.skillsSection);
+  }
+
+  return parts.join("\n\n");
 }
 
 export class AgyBridge {

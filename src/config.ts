@@ -29,6 +29,10 @@ export interface ServerConfig {
   allowedHosts: string[];
   publicBaseUrl: string;
   agy: AgyBridgeConfig;
+  skills: { enabled: boolean; paths: string[] };
+  codeMode: { enabled: boolean };
+  ui: { enabled: boolean };
+  activity: { enabled: boolean; maxCalls: number };
   logging: LoggingConfig;
 }
 
@@ -103,6 +107,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       exposedTools: env.DEVSPACE_AGY_TOOLS
         ? env.DEVSPACE_AGY_TOOLS.split(",").map((s) => s.trim()).filter(Boolean)
         : stored.agy.exposedTools,
+    },
+    skills: {
+      enabled: stored.skills.enabled,
+      paths: stored.skills.paths,
+    },
+    codeMode: {
+      enabled: env.DEVSPACE_CODE_MODE === "0"
+        ? false
+        : env.DEVSPACE_CODE_MODE === "1"
+          ? true
+          : stored.codeMode.enabled,
+    },
+    ui: {
+      enabled: stored.ui.enabled,
+    },
+    activity: {
+      enabled: stored.activity.enabled,
+      maxCalls: stored.activity.maxCalls,
     },
     logging: {
       ...stored.logging,

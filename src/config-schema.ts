@@ -38,6 +38,24 @@ const agyConfigSchema = z.object({
   exposedTools: z.array(z.string().trim().min(1)).min(1).default([...DEFAULT_AGY_EXPOSED_TOOLS]),
 }).passthrough().prefault({});
 
+const skillsConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  paths: z.array(z.string().trim().min(1)).default([]),
+}).passthrough().prefault({});
+
+const codeModeConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+}).passthrough().prefault({});
+
+const uiConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+}).passthrough().prefault({});
+
+const activityConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  maxCalls: z.number().int().min(50).max(10_000).default(500),
+}).passthrough().prefault({});
+
 const loggingConfigSchema = z.object({
   level: z.enum(["silent", "error", "warn", "info", "debug"]).default("info"),
   format: z.enum(["json", "pretty"]).default("json"),
@@ -80,6 +98,10 @@ export const devspaceConfigSchema = z.object({
   server: serverConfigSchema,
   storage: storageConfigSchema,
   agy: agyConfigSchema,
+  skills: skillsConfigSchema,
+  codeMode: codeModeConfigSchema,
+  ui: uiConfigSchema,
+  activity: activityConfigSchema,
   logging: loggingConfigSchema,
   oauth: oauthConfigSchema,
 }).passthrough();

@@ -9,11 +9,15 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import express, { type NextFunction, type Request, type Response } from "express";
-import { AgyBridge, buildServerInstructions } from "./agy-bridge.js";
+import { ActivityStore } from "./activity-store.js";
+import { createActivityWebRouter, WORKSPACE_WEB_PATH } from "./activity-web.js";
+import { AgyBridge, buildServerInstructions, type BridgeToolCallResult } from "./agy-bridge.js";
+import { CodeModeManager, codeModeToolDefinitions } from "./code-mode.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import { logEvent, requestIp, requestPath } from "./logger.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import { discoverLocalSkills, formatSkillsForInstructions } from "./skills.js";
 import { DEVSPACE_VERSION } from "./version.js";
 
 export interface RunningServer {
@@ -36,7 +40,6 @@ export async function createServer(
     app.set("trust proxy", config.logging.trustProxy);
   }
 
-  // Request logging middleware
   app.use((req, res, next) => {
     const startedAt = performance.now();
     res.on("finish", () => {
@@ -82,7 +85,19 @@ export async function createServer(
     await bridge.start();
   }
 
-  const instructions = buildServerInstructions(config.agy.holdMs);
+  const codeMode = config.codeMode.enabled
+    ? new CodeModeManager(bridge, config.agy.holdMs)
+    : undefined;
+
+  const activityStore = config.activity.enabled || config.ui.enabled
+    ? new ActivityStore(config.stateDir, config.activity.maxCalls)
+    : undefined;
+
+  const discoveredSkills = discoverLocalSkills(config.skills);
+  const instructions = buildServerInstructions(config.agy.holdMs, {
+    skillsSection: formatSkillsForInstructions(discoveredSkills),
+    codeModeEnabled: Boolean(codeMode),
+  });
 
   app.use(
     mcpAuthRouter({
@@ -95,12 +110,26 @@ export async function createServer(
     }),
   );
 
+  if (config.ui.enabled && activityStore) {
+    app.use(
+      WORKSPACE_WEB_PATH,
+      createActivityWebRouter({
+        ownerToken: config.oauth.ownerToken,
+        activity: activityStore,
+        activeMcpSessions: () => bridge.activeSessionCount(),
+      }),
+    );
+  }
+
   app.get("/healthz", (_req, res) => {
     res.json({
       ok: true,
       name: "devspace-agy-bridge",
       version: DEVSPACE_VERSION,
       activeSessions: bridge.activeSessionCount(),
+      skillsCount: discoveredSkills.length,
+      codeMode: Boolean(codeMode),
+      webUi: config.ui.enabled,
     });
   });
 
@@ -153,21 +182,25 @@ export async function createServer(
         },
       );
 
-      mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
-        tools: await bridge.listTools(),
-      }));
+      mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
+        const agyTools = await bridge.listTools();
+        const extraTools = codeMode ? codeModeToolDefinitions(config.agy.holdMs) : [];
+        return { tools: [...agyTools, ...extraTools] };
+      });
 
       mcpServer.setRequestHandler(CallToolRequestSchema, async (callReq) => {
-        const { name, arguments: toolArgs } = callReq.params;
+        const { name, arguments: rawToolArgs } = callReq.params;
+        const toolArgs = rawToolArgs as Record<string, unknown> | undefined;
+        const t0 = Date.now();
+        let result: BridgeToolCallResult;
         try {
-          const result = await bridge.callTool(
-            incomingSessionId,
-            name,
-            toolArgs as Record<string, unknown> | undefined,
-          );
-          return result;
+          if (codeMode?.isCodeModeTool(name)) {
+            result = await codeMode.callTool(incomingSessionId, name, toolArgs);
+          } else {
+            result = await bridge.callTool(incomingSessionId, name, toolArgs);
+          }
         } catch (error) {
-          return {
+          result = {
             content: [
               {
                 type: "text" as const,
@@ -177,6 +210,26 @@ export async function createServer(
             isError: true,
           };
         }
+
+        if (config.activity.enabled && activityStore) {
+          try {
+            const outputText = result.content
+              .map((c) => (c.type === "text" ? c.text : `[${c.type}]`))
+              .join("\n");
+            activityStore.recordCall({
+              mcpSessionId: incomingSessionId,
+              tool: name,
+              args: toolArgs,
+              outputText,
+              durationMs: Date.now() - t0,
+              isError: Boolean(result.isError),
+            });
+          } catch {
+            // Activity journaling must never fail a primary tool call.
+          }
+        }
+
+        return result;
       });
 
       res.on("close", () => {
@@ -215,9 +268,11 @@ export async function createServer(
     bridge,
     close: () => {
       closePromise ??= (async () => {
+        await codeMode?.close();
         if (ownsBridge) {
           await bridge.close();
         }
+        activityStore?.close();
         oauthProvider.close();
       })();
       return closePromise;
@@ -260,9 +315,13 @@ if (await isMainModule()) {
   const httpServer = app.listen(config.listenPort, config.host, () => {
     console.log(`devspace agy-bridge listening on http://${config.host}:${config.listenPort}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);
+    if (config.ui.enabled) {
+      console.log(`activity web ui: ${config.publicBaseUrl}${WORKSPACE_WEB_PATH}/`);
+    }
     console.log(`agy binary: ${config.agy.bin}`);
     console.log(`agy workspace: ${config.agy.workspace}`);
-    console.log(`exposed tools: ${config.agy.exposedTools.join(", ")}`);
+    console.log(`code mode: ${config.codeMode.enabled ? "enabled" : "disabled"}`);
+    console.log(`exposed agy tools: ${config.agy.exposedTools.join(", ")}`);
   });
 
   let shuttingDown = false;

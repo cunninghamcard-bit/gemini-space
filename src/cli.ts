@@ -4,10 +4,12 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { satisfies } from "semver";
 import { AgyBridge } from "./agy-bridge.js";
+import { codeModeToolDefinitions } from "./code-mode.js";
 import { loadConfig } from "./config.js";
 import { openDatabase } from "./db/client.js";
 import { createServer } from "./server.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import { discoverLocalSkills } from "./skills.js";
 import {
   generateOwnerToken,
   loadDevspaceFiles,
@@ -150,11 +152,19 @@ async function runDoctor(): Promise<void> {
     db.close();
   }
 
+  const skills = discoverLocalSkills(config.skills);
+  console.log(`local skills:    ${skills.length} discovered (${skills.slice(0, 6).map((s) => s.name).join(", ")}${skills.length > 6 ? ", …" : ""})`);
+  console.log(`code mode:       ${config.codeMode.enabled ? "enabled (execute, poll_execution, cancel_execution)" : "disabled"}`);
+  console.log(`activity /web:   ${config.ui.enabled ? `${config.publicBaseUrl}/web/` : "disabled"}`);
+
   const bridge = new AgyBridge(config.agy, { ...config.logging, level: "error" });
   try {
     await bridge.start();
-    const tools = await bridge.listTools();
-    console.log(`agy bridge:      ok (${tools.length} tools: ${tools.map((t) => t.name).join(", ")})`);
+    const tools = [
+      ...(await bridge.listTools()),
+      ...(config.codeMode.enabled ? codeModeToolDefinitions(config.agy.holdMs) : []),
+    ];
+    console.log(`mcp tools:       ok (${tools.length} tools: ${tools.map((t) => t.name).join(", ")})`);
   } finally {
     await bridge.close();
   }

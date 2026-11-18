@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -80,6 +80,12 @@ test(
     const stateDir = join(root, "state");
     const agyHome = join(root, "agy-home");
     const workspace = join(root, "workspace");
+    const customSkillsDir = join(root, "custom-skills");
+    await mkdir(join(customSkillsDir, "demo-skill"), { recursive: true });
+    await writeFile(
+      join(customSkillsDir, "demo-skill", "SKILL.md"),
+      "---\nname: demo-skill\ndescription: Demo skill for E2E verification\n---\n# Demo\n",
+    );
 
     // Start HTTP server with holdMs = 6000ms so we can test both:
     //   1) a command exceeding WaitMsBeforeAsync (1s -> finishes at 2.5s <= 6s holdMs) returning in ONE call, and
@@ -113,6 +119,20 @@ test(
         maxTurnsPerSession: 80,
         sessionIdleTtlMs: 600_000,
         exposedTools: ["read_file", "write_file", "edit_file", "run_command", "manage_task"],
+      },
+      skills: {
+        enabled: true,
+        paths: [customSkillsDir],
+      },
+      codeMode: {
+        enabled: true,
+      },
+      ui: {
+        enabled: true,
+      },
+      activity: {
+        enabled: true,
+        maxCalls: 200,
       },
       logging: {
         level: "error",
@@ -192,15 +212,27 @@ test(
     assert.ok(transportB.sessionId, "Sub Agent B received Mcp-Session-Id");
     assert.notEqual(transportA.sessionId, transportB.sessionId);
 
-    // 2. Verify exposed tools and cleaned JSON schemas
+    // 2. Verify exposed tools (5 agy + 3 Code Mode) and cleaned JSON schemas + skills instructions
+    assert.match(subAgentA.getInstructions() ?? "", /demo-skill/);
     const { tools } = await subAgentA.listTools();
     assert.deepEqual(
       tools.map((tool) => tool.name).sort(),
-      ["edit_file", "manage_task", "read_file", "run_command", "write_file"],
+      [
+        "cancel_execution",
+        "edit_file",
+        "execute",
+        "manage_task",
+        "poll_execution",
+        "read_file",
+        "run_command",
+        "write_file",
+      ],
     );
+    for (const tool of tools) {
+      assert.equal("$schema" in tool.inputSchema, false, `${tool.name} schema clean`);
+    }
     const readTool = tools.find((tool) => tool.name === "read_file")!;
     assert.match(readTool.description ?? "", /image/i);
-    assert.equal("$schema" in readTool.inputSchema, false);
 
     // 3. Verify write_file -> edit_file -> read_file (text + PNG image)
     const sampleTxt = join(workspace, "hello.txt");
@@ -313,7 +345,78 @@ test(
     assert.match(statusText, /LONG_ASYNC_DONE/);
     assert.match(statusText, /code 42/);
 
-    // 7. Verify stale/restarted Mcp-Session-Id header never returns 400 or 404
+    // 7. Verify Code Mode (execute batching multiple agy calls + poll_execution)
+    const batchFile = join(workspace, "codemode.txt");
+    const execRes = await subAgentA.callTool({
+      name: "execute",
+      arguments: {
+        code: `
+          await tools.write_file({ Path: ${JSON.stringify(batchFile)}, Content: "line1\\nline2\\n", Overwrite: true });
+          const r = await tools.read_file({ Path: ${JSON.stringify(batchFile)} });
+          console.log("batch ok");
+          return { containsLine2: r.text.includes("line2") };
+        `,
+      },
+    });
+    const execSnap = JSON.parse((execRes.content as Array<{ text?: string }>)[0]?.text ?? "{}") as {
+      status: string;
+      result?: { containsLine2?: boolean };
+      calls?: Array<{ tool: string }>;
+      logs?: string[];
+    };
+    assert.equal(execSnap.status, "completed");
+    assert.equal(execSnap.result?.containsLine2, true);
+    assert.equal(execSnap.calls?.length, 2);
+
+    const asyncExecRes = await subAgentA.callTool({
+      name: "execute",
+      arguments: {
+        code: `await sleep(1200); return "polled-ok";`,
+        yield_time_ms: 500,
+      },
+    });
+    const asyncSnap = JSON.parse((asyncExecRes.content as Array<{ text?: string }>)[0]?.text ?? "{}") as {
+      execution_id: string;
+      status: string;
+    };
+    assert.equal(asyncSnap.status, "running");
+    const polledRes = await subAgentA.callTool({
+      name: "poll_execution",
+      arguments: { execution_id: asyncSnap.execution_id, yield_time_ms: 3000 },
+    });
+    const polledSnap = JSON.parse((polledRes.content as Array<{ text?: string }>)[0]?.text ?? "{}") as {
+      status: string;
+      result?: string;
+    };
+    assert.equal(polledSnap.status, "completed");
+    assert.equal(polledSnap.result, "polled-ok");
+
+    // 8. Verify /web Activity UI auth + recorded session calls
+    const unauthWeb = await fetch(`${baseServerConfig.publicBaseUrl}/web/api/calls`);
+    assert.equal(unauthWeb.status, 401);
+
+    const loginRes = await fetch(`${baseServerConfig.publicBaseUrl}/web/login`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ owner_token: ownerToken }),
+      redirect: "manual",
+    });
+    assert.equal(loginRes.status, 303);
+    const cookie = loginRes.headers.get("set-cookie")?.split(";")[0] ?? "";
+    assert.match(cookie, /^devspace_web_session=/);
+
+    const authWeb = await fetch(`${baseServerConfig.publicBaseUrl}/web/api/calls`, {
+      headers: { cookie },
+    });
+    assert.equal(authWeb.status, 200);
+    const webData = (await authWeb.json()) as {
+      sessions: Array<{ mcpSessionId: string }>;
+      calls: Array<{ tool: string }>;
+    };
+    assert.ok(webData.sessions.length >= 2);
+    assert.ok(webData.calls.some((c) => c.tool === "execute"));
+
+    // 9. Verify stale/restarted Mcp-Session-Id header never returns 400 or 404
     const staleResp = await fetch(mcpUrl, {
       method: "POST",
       headers: {
