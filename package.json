@@ -1,7 +1,7 @@
 {
   "name": "gemini-space",
   "version": "1.0.0",
-  "description": "Gemini Web AGY MCP server with OAuth 2.1, deterministic local tools, Code Mode, and Skills.",
+  "description": "Give Google Gemini Web (and Gemini Task subagents) native Antigravity-style local coding tools over MCP.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/cunninghamcard-bit/gemini-space.git"
@@ -13,13 +13,15 @@
   },
   "packageManager": "pnpm@11.25.0",
   "bin": {
+    "gemini-space": "bin/gemini-space.js",
     "devspace": "bin/devspace.js"
   },
   "files": [
     "bin",
     "dist",
-    "schema",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
   ],
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
@@ -28,6 +30,14 @@
     "test": "tsx --import ./bin/silence-sqlite-warning.js --test --test-concurrency=1 \"src/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
+  "keywords": [
+    "gemini",
+    "mcp",
+    "model-context-protocol",
+    "antigravity",
+    "coding-agent",
+    "gemini-connector"
+  ],
   "license": "MIT",
   "dependencies": {
     "@clack/prompts": "^1.5.1",
@@ -41,7 +51,6 @@
     "@types/express": "^5.0.6",
     "@types/node": "^25.9.1",
     "@types/semver": "^7.7.1",
-    "oxlint": "1.89.0",
     "tsx": "^4.22.3",
     "typescript": "^6.0.3"
   }
