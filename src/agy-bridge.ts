@@ -247,21 +247,35 @@ export class AgyBridge {
     targetEntry.lastUsedAt = Date.now();
 
     const execute = async (): Promise<BridgeToolCallResult> => {
-      // 1. If checking status on a known running background task, hold up to holdMs outside serial lock.
+      // 1. If checking status on a task, wait if still running and prefer the full <SYSTEM_MESSAGE>
+      //    completion payload (which preserves exit code and ~10KB output, unlike agy's status summary).
       if (
         name === "manage_task"
         && args.Action === "status"
         && typeof args.TaskId === "string"
-        && targetEntry.runningTasks.has(args.TaskId)
       ) {
-        const holdStart = Date.now();
-        await targetEntry.waitForTask(args.TaskId, this.config.holdMs);
-        logEvent(this.logging, "debug", "agy_task_hold", {
-          tool: "manage_task",
-          taskId: args.TaskId,
-          waitedMs: Date.now() - holdStart,
-          finished: !targetEntry.runningTasks.has(args.TaskId),
-        });
+        if (targetEntry.runningTasks.has(args.TaskId)) {
+          const holdStart = Date.now();
+          await targetEntry.waitForTask(args.TaskId, this.config.holdMs);
+          logEvent(this.logging, "debug", "agy_task_hold", {
+            tool: "manage_task",
+            taskId: args.TaskId,
+            waitedMs: Date.now() - holdStart,
+            finished: !targetEntry.runningTasks.has(args.TaskId),
+          });
+        }
+
+        const finishedOutput = targetEntry.completedTaskOutputs.get(args.TaskId);
+        if (finishedOutput !== undefined) {
+          for (const n of targetEntry.notices) {
+            if (n.sender === args.TaskId) n.delivered = true;
+          }
+          targetEntry.completedTaskOutputs.delete(args.TaskId);
+          const extraNotices = targetEntry.takeFreshNotices(args.TaskId);
+          return {
+            content: [{ type: "text", text: finishedOutput + extraNotices }],
+          };
+        }
       }
 
       const callStart = Date.now();
@@ -845,6 +859,27 @@ export class AgyBridge {
 
     if (cascadeId) {
       this.scanSessionNotices(cascadeId, parsed.turns);
+      // Bug fix: when a background task finishes during a foreground tool call on the same session,
+      // agy appends <SYSTEM_MESSAGE> inside functionResponse.response.output rather than a user text part.
+      if (parsed.toolResult?.text) {
+        try {
+          const respObj = JSON.parse(parsed.toolResult.text) as { output?: unknown };
+          if (typeof respObj.output === "string" && respObj.output.includes("<SYSTEM_MESSAGE>")) {
+            this.scanSessionNotices(cascadeId, [{ role: "user", text: respObj.output }]);
+            // Strip the embedded <SYSTEM_MESSAGE> block from the foreground tool's raw output so
+            // notices are delivered cleanly once via SessionNotice without duplication.
+            const stripped = respObj.output.replace(
+              /\n*The following is a <SYSTEM_MESSAGE>[\s\S]*<\/SYSTEM_MESSAGE>\s*$/,
+              "",
+            );
+            parsed.toolResult.text = JSON.stringify({ ...respObj, output: stripped });
+          }
+        } catch {
+          if (parsed.toolResult.text.includes("<SYSTEM_MESSAGE>")) {
+            this.scanSessionNotices(cascadeId, [{ role: "user", text: parsed.toolResult.text }]);
+          }
+        }
+      }
     }
 
     if (parsed.toolResult) {
@@ -886,15 +921,24 @@ export class AgyBridge {
     const entry = this.sessionsByAgyId.get(cascadeId);
     if (!entry) return;
 
-    const re =
-      /\[Message\] timestamp=(\S+) sender=(\S+) priority=\S+ content=([\s\S]*?)(?=\n\[Message\] |<\/SYSTEM_MESSAGE>)/g;
+    const msgHeaderRe =
+      /\[Message\] timestamp=(\d{4}-\d{2}-\d{2}T\S+) sender=(\S+) priority=\S+ content=/g;
 
     for (const turn of turns) {
       if (turn.role !== "user" || !turn.text.includes("<SYSTEM_MESSAGE>")) continue;
-      for (const match of turn.text.matchAll(re)) {
-        const ts = match[1]!;
-        const sender = match[2]!;
-        const text = match[3]!.trim();
+      const openIdx = turn.text.indexOf("<SYSTEM_MESSAGE>");
+      const closeIdx = turn.text.lastIndexOf("</SYSTEM_MESSAGE>");
+      if (openIdx < 0 || closeIdx <= openIdx) continue;
+
+      const block = turn.text.slice(openIdx + "<SYSTEM_MESSAGE>".length, closeIdx);
+      const headers = [...block.matchAll(msgHeaderRe)];
+      for (let i = 0; i < headers.length; i += 1) {
+        const hdr = headers[i]!;
+        const ts = hdr[1]!;
+        const sender = hdr[2]!;
+        const contentStart = (hdr.index ?? 0) + hdr[0].length;
+        const contentEnd = i + 1 < headers.length ? (headers[i + 1]!.index ?? block.length) : block.length;
+        const text = block.slice(contentStart, contentEnd).trim();
         const dedupeKey = `${ts} ${sender}`;
         if (entry.seenNotices.has(dedupeKey)) continue;
 

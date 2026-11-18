@@ -281,11 +281,12 @@ test(
     assert.match(heldText, /HELD_ONE_SHOT_DONE/);
 
     // 6. Verify command exceeding holdMs (sleep 7.5s > holdMs 5.5s) returns TaskId,
-    //    Sub Agent B does NOT see Sub Agent A's task, and manage_task(status) holds until completion!
+    //    Sub Agent B does NOT see Sub Agent A's task, and manage_task(status) holds until completion
+    //    AND preserves the real exit code (42) from <SYSTEM_MESSAGE>!
     const longCmdRes = await subAgentA.callTool({
       name: "run_command",
       arguments: {
-        CommandLine: "sleep 7.5 && echo LONG_ASYNC_DONE",
+        CommandLine: "sleep 7.5 && echo LONG_ASYNC_DONE && exit 42",
         WaitMsBeforeAsync: 600,
         toolSummary: "Long async command",
       },
@@ -310,6 +311,7 @@ test(
     });
     const statusText = (statusRes.content as Array<{ text?: string }>)[0]?.text ?? "";
     assert.match(statusText, /LONG_ASYNC_DONE/);
+    assert.match(statusText, /code 42/);
 
     // 7. Verify stale/restarted Mcp-Session-Id header never returns 400 or 404
     const staleResp = await fetch(mcpUrl, {
